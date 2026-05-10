@@ -155,18 +155,40 @@ public static IResult HandleRequest(
 
 **Handler:**
 ```csharp
+// Symmetric send paths: this.SendAsync(...) for the inbound (framework-owned) socket;
+// _aiSocket.SendAsync(...) for the outbound (handler-owned) socket. Neither requires
+// IConnectionSender — that's reserved for cross-cutting code (AI tool-call → Conductor
+// → progress stream-back) where the abstraction earns its keep.
 public sealed class TwilioMediaHandler : WebSocketHandler {
 
+    private ClientWebSocket? _aiSocket;
+
     public override async Task OnConnectedAsync(CancellationToken ct) {
-        // Open outbound AI socket; spawn its read loop.
-        // When the AI side ends, call Connection!.Abort() to terminate inbound.
+        _aiSocket = await ConnectToAiAsync(ct);
+
+        // AI receive loop on a background task. SendAsync from inside Task.Run works
+        // because it resolves through this.Connection — no AsyncLocal dependency.
+        _ = Task.Run(async () => {
+            try {
+                await foreach (var aiEvent in ReadAiEventsAsync(_aiSocket, ct)) {
+                    if (TryExtractAudio(aiEvent, out var streamSid, out var audio)) {
+                        var msg = TwilioMediaMessage.Create(streamSid, audio);
+                        await SendAsync(msg, ct);   // ← inbound, handler-bound
+                    }
+                }
+            } finally {
+                Connection!.Abort();   // AI ended → terminate inbound
+            }
+        }, ct);
     }
 
     public override async Task OnMessageAsync(
         IInvocationContext context,
         ReadOnlyMemory<byte> message,
         WebSocketMessageType messageType) {
-        // Forward Twilio frames to AI. context.Aborted = connection cancellation.
+
+        // Forward Twilio frames to handler-owned AI socket. Direct send; no framework involved.
+        await _aiSocket!.SendAsync(message, messageType, endOfMessage: true, context.Aborted);
     }
 
     public override async Task OnDisconnectedAsync(DisconnectInfo info, CancellationToken ct) {
@@ -174,7 +196,7 @@ public sealed class TwilioMediaHandler : WebSocketHandler {
         if (info.Exception is not null) {
             _logger.LogError(info.Exception, "Call ended with error");
         }
-        // Close the outbound AI socket; complete the call record.
+        // Close the outbound AI socket; complete the call record (within ct budget).
     }
 }
 ```

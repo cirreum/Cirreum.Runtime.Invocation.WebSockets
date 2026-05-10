@@ -208,8 +208,11 @@ public static class TwilioApi {
 
 **Handler:**
 ```csharp
+// Note the symmetry: handler-bound `this.SendAsync(...)` for the inbound (Twilio) socket,
+// direct `_aiSocket.SendAsync(...)` for the outbound (handler-owned) socket. No DI needed
+// for the voice-frame hot path. IConnectionSender stays available for cross-cutting code
+// (Conductor command handlers triggered from AI tool calls — see "Server-initiated push").
 public sealed class TwilioMediaHandler(
-    IConnectionSender sender,
     IAiClient ai,
     IDomainApi domain,
     ILogger<TwilioMediaHandler> logger) : WebSocketHandler {
@@ -223,7 +226,12 @@ public sealed class TwilioMediaHandler(
 
         _aiTask = Task.Run(async () => {
             try {
-                await ReadFromAiAsync(_aiSocket, ct);
+                await foreach (var aiEvent in ReadAiEventsAsync(_aiSocket, ct)) {
+                    if (TryExtractAudio(aiEvent, out var streamSid, out var audio)) {
+                        var msg = TwilioMediaMessage.Create(streamSid, audio);
+                        await SendAsync(msg, ct);   // ← handler-bound, works in this Task.Run
+                    }
+                }
             } finally {
                 // AI side ended — terminate the inbound transport too
                 Connection!.Abort();
@@ -235,7 +243,10 @@ public sealed class TwilioMediaHandler(
         IInvocationContext context,
         ReadOnlyMemory<byte> message,
         WebSocketMessageType messageType) {
-        // Forward Twilio media frames to the AI socket. context.Aborted = connection cancellation.
+
+        // Forward Twilio media frames to the AI socket. _aiSocket is handler-owned —
+        // direct SendAsync; no framework involvement.
+        await _aiSocket!.SendAsync(message, messageType, endOfMessage: true, context.Aborted);
     }
 
     public override async Task OnDisconnectedAsync(DisconnectInfo info, CancellationToken ct) {
@@ -332,7 +343,32 @@ Names match **case-insensitively** — Twilio's `CallSid` form field auto-fills 
 
 ## Server-initiated push
 
-Inject `IConnectionSender` from any code running inside the WebSocket invocation pipeline (handler hooks, Conductor command/query handlers triggered from `OnMessageAsync`) to push to the calling client:
+The framework offers two complementary push APIs. They route to the same client over the same wire format; the choice is about *who's calling* the push.
+
+### `this.SendAsync(...)` — handler-bound (handler-internal code)
+
+Three protected overloads on `WebSocketHandler`:
+
+```csharp
+protected ValueTask SendAsync<T>(T payload, CancellationToken ct = default);
+protected ValueTask SendAsync<T>(string method, T payload, CancellationToken ct = default);
+protected ValueTask SendAsync(
+    ReadOnlyMemory<byte> payload,
+    WebSocketMessageType type = WebSocketMessageType.Binary,
+    CancellationToken ct = default);
+```
+
+Resolves the underlying `WebSocket` directly through `this.Connection`. **No accessor lookup, no `IInvocationContextAccessor` dependency** — works from any calling context inside the handler, including handler-managed `Task.Run` background loops, timers, and fire-and-forget continuations. The IVA-style voice example above uses this for the audio-frame hot path:
+
+```csharp
+await SendAsync(twilioMediaMessage, ct);   // ← from inside Task.Run, just works
+```
+
+Use this for **handler-internal push** — by far the common case for WebSocket apps that own outbound state and forward it to the inbound caller (voice, telemetry, custom protocols).
+
+### `IConnectionSender` — ambient-invocation-aware (cross-cutting code)
+
+Inject `IConnectionSender` from cross-cutting code that doesn't know its transport — Conductor command/query handlers, validators, transport-agnostic services. Resolves the active connection through `IInvocationContextAccessor.Current`, so the same handler code can push back over HTTP, SignalR, or WebSocket without knowing which it's running on:
 
 ```csharp
 public sealed class GenerateReportHandler(
@@ -352,19 +388,20 @@ public sealed class GenerateReportHandler(
 }
 ```
 
-Same handler runs from HTTP, SignalR, or WebSocket — the seam unifies them. The HTTP caller gets only the return value; the SignalR / WebSocket caller gets the progress stream *and* the return value.
+Same command handler runs from HTTP, SignalR, or WebSocket — the seam unifies them. The HTTP caller gets only the return value; the SignalR / WebSocket caller gets the progress stream *and* the return value.
 
-### What `IConnectionSender` does and doesn't do
+### When to use which
 
-`IConnectionSender` is **bound to the active invocation** — it pushes to the connection that delivered the *currently-executing* message. It is **not** a general server-to-client push mechanism for arbitrary connections.
+| You're writing | Use | Why |
+|---|---|---|
+| Code inside a `WebSocketHandler` (any lifecycle hook or handler-owned background task) | **`this.SendAsync(...)`** | You have direct access to `Connection`. No need to re-resolve through ambient state. Works regardless of `ExecutionContext` flow. |
+| A Conductor command/query handler that may be invoked from HTTP, SignalR, or WebSocket | **`IConnectionSender`** | The handler doesn't know its transport. The ambient accessor is the seam. |
 
-| You want to | Use |
-|---|---|
-| Push extra messages to the client that triggered this message (progress, streaming partial results) | **`IConnectionSender`** (Cirreum-abstracted) |
-| Broadcast / target by ConnectionId / target by group | Not directly supported on raw WebSocket — see the [BACKLOG](docs/BACKLOG.md) "Connection registry / fan-out push" entry |
-| Push from a background service or timer | Out of scope for `IConnectionSender` (no active invocation) — apps build their own connection registry today |
+The two complement perfectly for the AI tool-call story: voice-frame forwarding stays on `this.SendAsync(...)` (handler-bound, hot path); AI tool calls dispatched through Conductor reach back via `IConnectionSender` for progress streaming, under the same authenticated identity that the WebSocket was opened with.
 
-For broadcast/group/by-id push patterns, use SignalR (`Cirreum.Runtime.Invocation.SignalR`) — it has these capabilities natively via `IHubContext<THub>.Clients.X.SendAsync(...)`. Raw WebSocket is appropriate for streaming pipelines where each connection is independent (voice, telemetry); SignalR is appropriate when broadcast/group/presence are core requirements.
+### What neither API does
+
+Both APIs push only to the *currently-executing* connection. Broadcast / target-by-ConnectionId / target-by-group is **not** built into raw WebSocket today — see [BACKLOG](docs/BACKLOG.md) "Connection registry / fan-out push." For those patterns, use SignalR (`Cirreum.Runtime.Invocation.SignalR`) — it has them natively via `IHubContext<THub>.Clients.X.SendAsync(...)`. Raw WebSocket is appropriate for streaming pipelines where each connection is independent (voice, telemetry); SignalR is appropriate when broadcast/group/presence are core requirements.
 
 ## Connection lifecycle
 
