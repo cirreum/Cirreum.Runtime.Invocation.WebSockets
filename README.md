@@ -454,5 +454,5 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-**Cirreum Foundation Framework**
+**Cirreum Foundation Framework**  
 *Layered simplicity for modern .NET*
