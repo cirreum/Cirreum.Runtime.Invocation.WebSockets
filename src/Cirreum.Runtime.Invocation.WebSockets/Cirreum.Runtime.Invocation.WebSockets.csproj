@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<RootNamespace>Cirreum.Runtime</RootNamespace>
+		<Description>Runtime Extensions package for the Cirreum WebSocket invocation source — app-facing AddWebSocketInvocation() / AddWebSocket&lt;THandler&gt;() / MapWebSocketInvocation() extensions that wire WebSocket handlers into the unified IInvocationContext seam from configuration.</Description>
+		<PackageTags>cirreum;runtime;invocation;websocket;providers</PackageTags>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Cirreum.Runtime.InvocationProvider" Version="1.1.1" />
+		<PackageReference Include="Cirreum.Invocation.WebSockets" Version="1.0.0" />
+	</ItemGroup>
+
+</Project>
