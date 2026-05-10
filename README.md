@@ -17,7 +17,7 @@
 - `MapWebSocketInvocation()` on `IEndpointRouteBuilder` — invokes every `InvocationProviderMapping` whose `ProviderName` matches `WebSocketInvocationRegistrar.ProviderKey`, walking enabled instances and mapping each WebSocket endpoint (and its optional request endpoint) at the configured paths. Calls `app.UseWebSockets()` automatically.
 - `IWebSocketRequestBuilder` — slim, framework-specific minimal API surface for the request endpoint with `Map(handler, configure?)` (defaults to POST) and `Map(httpMethod, handler, configure?)` (explicit method) overloads.
 
-Apps install this package directly. It transitively pulls the L3 `Cirreum.Invocation.WebSockets` (registrar, orchestrator, connection adapter, `IConnectionSender` impl, `IWebSocketUrlBuilder`) and the L4 `Cirreum.Runtime.InvocationProvider` (helper, scope object).
+Apps install this package directly. It transitively pulls the L3 `Cirreum.Invocation.WebSockets` (registrar, orchestrator, `IWebSocketConnection` interface and impl, `IWebSocketUrlBuilder`) and the L4 `Cirreum.Runtime.InvocationProvider` (helper, scope object).
 
 ## Architectural position
 
@@ -51,13 +51,14 @@ Mirrors the SignalR L5 package's shape — same SRP-split, same per-source/umbre
 
 ## How registration works
 
-The `AddWebSocketInvocation()` extension does two things:
+The `AddWebSocketInvocation()` extension does three things:
 
-1. Marker-dedup'd: registers the WebSocket invocation source by calling `builder.RegisterInvocationProvider<WebSocketInvocationRegistrar, WebSocketInvocationSettings, WebSocketInvocationInstanceSettings>()` from the L4 helper. The L4 helper:
+1. Marker-dedup'd: binds the provider's `WebSocketOptions` sub-section to `IOptions<WebSocketOptions>` via `services.Configure<WebSocketOptions>(section)`. The ASP.NET WebSocket middleware reads this from DI at request time, so `MapWebSocketInvocation()`'s call to `app.UseWebSockets()` automatically picks up provider-level `KeepAliveInterval`, `KeepAliveTimeout`, `AllowedOrigins` defaults — no hand-rolled `app.UseWebSockets(options)` call required.
+2. Marker-dedup'd: registers the WebSocket invocation source by calling `builder.RegisterInvocationProvider<WebSocketInvocationRegistrar, WebSocketInvocationSettings, WebSocketInvocationInstanceSettings>()` from the L4 helper. The L4 helper:
    - Binds `Cirreum:Invocation:Providers:WebSocket` from `IConfiguration` to `WebSocketInvocationSettings`.
-   - Calls `registrar.Register(...)` — services phase — which binds `IOptions<WebSocketInvocationSettings>`, registers `IWebSocketUrlBuilder`, registers `WebSocketOrchestrator`, registers `IConnectionSender` → `WebSocketConnectionSender`, and validates per-instance settings (paths, hard caps).
+   - Calls `registrar.Register(...)` — services phase — which binds `IOptions<WebSocketInvocationSettings>`, registers `IWebSocketUrlBuilder`, registers `WebSocketOrchestrator`, and validates per-instance settings (paths, hard caps).
    - Stashes an `InvocationProviderMapping` in DI capturing the deferred `registrar.Map(...)` closure.
-2. Opens the `IInvocationBuilder` scope for the configure callback so apps can chain `AddWebSocket<THandler>(instanceKey, request: ...)` calls per handler-type.
+3. Opens the `IInvocationBuilder` scope for the configure callback so apps can chain `AddWebSocket<THandler>(instanceKey, request: ...)` calls per handler-type.
 
 Inside the configure callback, each `AddWebSocket<THandler>(instanceKey, request: ...)` call:
 
@@ -75,12 +76,21 @@ Inside the configure callback, each `AddWebSocket<THandler>(instanceKey, request
 
 ## Configuration
 
+WebSocket exposes two configuration surfaces — Cirreum mirrors each as an explicit, named sub-section. Cirreum framework fields (`Enabled`, `Path`, `Scheme`, etc.) live at the instance-section root; ASP.NET-native `WebSocketOptions` provider-wide defaults live in a sibling `WebSocketOptions` sub-section so the two roles never collide.
+
 ```json
 {
   "Cirreum": {
     "Invocation": {
       "Providers": {
         "WebSocket": {
+
+          "WebSocketOptions": {
+            "KeepAliveInterval": "00:02:00",
+            "KeepAliveTimeout":  "00:00:30",
+            "AllowedOrigins":    [ "https://app.example.com" ]
+          },
+
           "Instances": {
 
             "media": {
@@ -109,6 +119,13 @@ Inside the configure callback, each `AddWebSocket<THandler>(instanceKey, request
 }
 ```
 
+| Sub-section | Binds to | Scope |
+|---|---|---|
+| `Providers:WebSocket:WebSocketOptions` | ASP.NET `WebSocketOptions` (provider-wide) | Defaults applied to the WebSocket middleware process-wide via `IOptions<WebSocketOptions>` |
+| `Providers:WebSocket:Instances:{key}` | `WebSocketInvocationInstanceSettings` | Per-instance Cirreum-framework fields (Path, RequestPath, Scheme, …) and per-connection overrides |
+
+### Per-instance fields
+
 | Field | Default | Hard cap | Purpose |
 |---|---|---|---|
 | `Enabled` | `false` | — | Per-instance gate |
@@ -118,10 +135,22 @@ Inside the configure callback, each `AddWebSocket<THandler>(instanceKey, request
 | `DisconnectTimeoutSeconds` | 30 | 300 | Cleanup budget for `OnDisconnectedAsync` hooks |
 | `MaxMessageSizeBytes` | 64 KB | 8 MB | Max bytes per complete message; oversize → `MessageTooBig` close |
 | `ReceiveBufferSizeBytes` | 4 KB | 64 KB | Initial pooled receive buffer per connection |
-| `KeepAliveInterval` | null | — | Override `WebSocketOptions.KeepAliveInterval` (default 2 min) |
-| `KeepAliveTimeout` | null | — | Override `WebSocketOptions.KeepAliveTimeout` (default 30 s) |
+| `KeepAliveInterval` | null | — | Per-connection override of provider-level `WebSocketOptions.KeepAliveInterval` (default 2 min). Applied at `AcceptWebSocketAsync` time for this instance only |
+| `KeepAliveTimeout` | null | — | Per-connection override of provider-level `WebSocketOptions.KeepAliveTimeout` (default 30 s). Applied at `AcceptWebSocketAsync` time for this instance only |
 
 `Scheme` references a configured Authorization instance under `Cirreum:Authorization:Providers:*:Instances:{Scheme}`. Optional — leave unset for unauthenticated endpoints (rare).
+
+### Provider-level `WebSocketOptions`
+
+`AddWebSocketInvocation()` binds this sub-section directly to ASP.NET's `IOptions<WebSocketOptions>` (via `services.Configure<WebSocketOptions>(section)`). The WebSocket middleware reads from DI, so `MapWebSocketInvocation()`'s call to `app.UseWebSockets()` automatically picks them up — no separate `app.UseWebSockets(options)` call required.
+
+| Field | Default | Purpose |
+|---|---|---|
+| `KeepAliveInterval` | 2 minutes | Protocol-level ping interval (provider-wide default) |
+| `KeepAliveTimeout` | 30 seconds | Abort the connection if no pong within this time (provider-wide default) |
+| `AllowedOrigins` | (empty — no filtering) | Origin header allowlist for CSWSH defense. **Low-priority for Cirreum apps** — the API-first/cookieless design eliminates the attack surface; only relevant if mixing cookie auth and WebSocket |
+
+Programmatic configuration (`services.Configure<WebSocketOptions>(o => ...)`) still works alongside the JSON binding — the options system merges sources naturally. Apps still wanting to call `app.UseWebSockets(options)` themselves with a hand-built options instance can do so before `MapWebSocketInvocation()`; that bypasses the DI-resolved options and uses the passed instance.
 
 ## Quick start — telemetry endpoint (single-phase)
 
@@ -137,7 +166,7 @@ app.Run();
 ```
 
 ```csharp
-public sealed class TelemetryHandler(IConnectionSender sender) : WebSocketHandler {
+public sealed class TelemetryHandler : WebSocketHandler {
 
     public override async Task OnMessageAsync(
         IInvocationContext context,
@@ -146,7 +175,7 @@ public sealed class TelemetryHandler(IConnectionSender sender) : WebSocketHandle
 
         var batch = JsonSerializer.Deserialize<TelemetryBatch>(message.Span);
         await ProcessAsync(batch, context.Aborted);
-        await sender.SendAsync("Ack", new { count = batch.Items.Count }, context.Aborted);
+        await SendAsync("Ack", new { count = batch.Items.Count }, context.Aborted);
     }
 
 }
@@ -208,10 +237,12 @@ public static class TwilioApi {
 
 **Handler:**
 ```csharp
-// Note the symmetry: handler-bound `this.SendAsync(...)` for the inbound (Twilio) socket,
-// direct `_aiSocket.SendAsync(...)` for the outbound (handler-owned) socket. No DI needed
-// for the voice-frame hot path. IConnectionSender stays available for cross-cutting code
-// (Conductor command handlers triggered from AI tool calls — see "Server-initiated push").
+// Note the symmetry: handler-bound `this.SendAsync(...)` for typed JSON to the inbound
+// (Twilio) socket; for binary audio frames, call `this.Connection.SendBytesAsync(...)`
+// directly (Connection is typed as IWebSocketConnection — no cast). The outbound
+// (handler-owned) AI socket uses its own SendAsync directly. Cross-cutting code (Conductor
+// handlers triggered from AI tool calls) reaches the inbound connection through
+// accessor.Current?.Connection — see "Server-initiated push".
 public sealed class TwilioMediaHandler(
     IAiClient ai,
     IDomainApi domain,
@@ -343,65 +374,96 @@ Names match **case-insensitively** — Twilio's `CallSid` form field auto-fills 
 
 ## Server-initiated push
 
-The framework offers two complementary push APIs. They route to the same client over the same wire format; the choice is about *who's calling* the push.
+Three flavors, all routing to the same calling client. Pick by audience and payload shape.
 
-### `this.SendAsync(...)` — handler-bound (handler-internal code)
+### `this.SendAsync(...)` — handler-bound, typed JSON
 
-Three protected overloads on `WebSocketHandler`:
+Two protected overloads on `WebSocketHandler`:
 
 ```csharp
 protected ValueTask SendAsync<T>(T payload, CancellationToken ct = default);
 protected ValueTask SendAsync<T>(string method, T payload, CancellationToken ct = default);
-protected ValueTask SendAsync(
-    ReadOnlyMemory<byte> payload,
-    WebSocketMessageType type = WebSocketMessageType.Binary,
-    CancellationToken ct = default);
 ```
 
-Resolves the underlying `WebSocket` directly through `this.Connection`. **No accessor lookup, no `IInvocationContextAccessor` dependency** — works from any calling context inside the handler, including handler-managed `Task.Run` background loops, timers, and fire-and-forget continuations. The IVA-style voice example above uses this for the audio-frame hot path:
+Thin forwarders to `Connection.SendAsync(...)`. Both send `WebSocketMessageType.Text` frames. JSON-serialization uses `SerializerOptions` (captured onto the connection at upgrade — override `SerializerOptions` to wire in a source-gen `JsonTypeInfoResolver`). **No accessor lookup, no `IInvocationContextAccessor` dependency** — works from any calling context inside the handler, including handler-managed `Task.Run` background loops, timers, and fire-and-forget continuations. The IVA-style voice example above uses this for the audio-frame hot path:
 
 ```csharp
 await SendAsync(twilioMediaMessage, ct);   // ← from inside Task.Run, just works
 ```
 
-Use this for **handler-internal push** — by far the common case for WebSocket apps that own outbound state and forward it to the inbound caller (voice, telemetry, custom protocols).
+Use this for **handler-internal typed-JSON push** — the common case for WebSocket apps that own outbound state and forward it to the inbound caller (voice, telemetry, custom protocols).
 
-### `IConnectionSender` — ambient-invocation-aware (cross-cutting code)
+### `IInvocationConnection.SendAsync<T>` — ambient, typed JSON (cross-cutting code)
 
-Inject `IConnectionSender` from cross-cutting code that doesn't know its transport — Conductor command/query handlers, validators, transport-agnostic services. Resolves the active connection through `IInvocationContextAccessor.Current`, so the same handler code can push back over HTTP, SignalR, or WebSocket without knowing which it's running on:
+From cross-cutting code that doesn't know its transport — Conductor command/query handlers, validators, transport-agnostic services — reach the connection through the ambient `IInvocationContextAccessor.Current`. The same handler code can push back over HTTP, SignalR, or WebSocket without knowing which it's running on:
 
 ```csharp
-public sealed class GenerateReportHandler(
-    IInvocationContextAccessor accessor,
-    IConnectionSender sender) : ICommandHandler<GenerateReportCommand> {
+public sealed class GenerateReportHandler(IInvocationContextAccessor accessor)
+    : ICommandHandler<GenerateReportCommand> {
 
     public async ValueTask<Result> Handle(GenerateReportCommand cmd, CancellationToken ct) {
-        var canPush = accessor.Current?.Connection is not null;
-
-        if (canPush) await sender.SendAsync("Progress", new { Percent = 0, Stage = "Loading" }, ct);
+        var connection = accessor.Current?.Connection;
+        if (connection is not null) {
+            await connection.SendAsync("Progress", new { Percent = 0, Stage = "Loading" }, ct);
+        }
         // ... work ...
-        if (canPush) await sender.SendAsync("Progress", new { Percent = 100, Stage = "Done" }, ct);
-
+        if (connection is not null) {
+            await connection.SendAsync("Progress", new { Percent = 100, Stage = "Done" }, ct);
+        }
         return Result.Success(/* ... */);
     }
 
 }
 ```
 
-Same command handler runs from HTTP, SignalR, or WebSocket — the seam unifies them. The HTTP caller gets only the return value; the SignalR / WebSocket caller gets the progress stream *and* the return value.
+Same command handler runs from HTTP, SignalR, or WebSocket — the seam unifies them. The HTTP caller gets only the return value (the connection is `null`); the SignalR / WebSocket caller gets the progress stream *and* the return value. Cross-cutting code automatically picks up the handler's `SerializerOptions` (the connection captures them at upgrade time) — including any source-generated `JsonTypeInfoResolver` the app configured.
+
+### `IWebSocketConnection.SendBytesAsync` — raw frame writes (binary protocols, audio)
+
+Inside a handler, call directly on `this.Connection` — the property is typed as `IWebSocketConnection` (which extends `IInvocationConnection`), so binary frames need no cast:
+
+```csharp
+public sealed class TwilioMediaHandler : WebSocketHandler {
+
+    public override async Task OnMessageAsync(
+        IInvocationContext context,
+        ReadOnlyMemory<byte> message,
+        WebSocketMessageType messageType) {
+
+        var (audioChunk, mark) = TwilioMessage.Parse(message);
+
+        // Typed JSON via the handler shortcut
+        await SendAsync(mark, context.Aborted);
+
+        // Raw bytes — straight on Connection, no cast
+        await this.Connection.SendBytesAsync(audioChunk, WebSocketMessageType.Binary, context.Aborted);
+    }
+
+}
+```
+
+From cross-cutting WebSocket-aware code (which holds only the L2 `IInvocationConnection?` view), the cast IS the explicit "I'm using WebSocket-specific behavior" acknowledgment:
+
+```csharp
+if (accessor.Current?.Connection is IWebSocketConnection ws) {
+    await ws.SendBytesAsync(audioChunk, WebSocketMessageType.Binary, ct);
+}
+```
 
 ### When to use which
 
-| You're writing | Use | Why |
-|---|---|---|
-| Code inside a `WebSocketHandler` (any lifecycle hook or handler-owned background task) | **`this.SendAsync(...)`** | You have direct access to `Connection`. No need to re-resolve through ambient state. Works regardless of `ExecutionContext` flow. |
-| A Conductor command/query handler that may be invoked from HTTP, SignalR, or WebSocket | **`IConnectionSender`** | The handler doesn't know its transport. The ambient accessor is the seam. |
+| You're writing | Use |
+|---|---|
+| Typed JSON push from inside a `WebSocketHandler` (any lifecycle hook or background task) | **`this.SendAsync(payload, ct)`** / **`this.SendAsync(method, payload, ct)`** — handler shortcut |
+| Typed JSON push from cross-cutting code (Conductor handlers, validators, transport-agnostic services) | **`accessor.Current?.Connection?.SendAsync(...)`** — ambient connection, transport-agnostic |
+| Raw frame writes (binary protocols, audio, pre-serialized payloads) — handler internal | **`this.Connection.SendBytesAsync(...)`** — `Connection` is typed as `IWebSocketConnection`, no cast |
+| Raw frame writes from cross-cutting WebSocket-aware code | **`(accessor.Current?.Connection as IWebSocketConnection)?.SendBytesAsync(...)`** — explicit downcast acknowledges WebSocket-specific behavior |
 
-The two complement perfectly for the AI tool-call story: voice-frame forwarding stays on `this.SendAsync(...)` (handler-bound, hot path); AI tool calls dispatched through Conductor reach back via `IConnectionSender` for progress streaming, under the same authenticated identity that the WebSocket was opened with.
+The three complement perfectly for the AI tool-call story: typed JSON acks stay on `this.SendAsync(...)` (handler-bound, hot path); audio frames go through `this.Connection.SendBytesAsync(...)`; AI tool calls dispatched through Conductor reach back via `accessor.Current?.Connection?.SendAsync(...)` for progress streaming, under the same authenticated identity that the WebSocket was opened with — and using the same handler-configured source-gen JSON.
 
-### What neither API does
+### What none of these APIs does
 
-Both APIs push only to the *currently-executing* connection. Broadcast / target-by-ConnectionId / target-by-group is **not** built into raw WebSocket today — see [BACKLOG](docs/BACKLOG.md) "Connection registry / fan-out push." For those patterns, use SignalR (`Cirreum.Runtime.Invocation.SignalR`) — it has them natively via `IHubContext<THub>.Clients.X.SendAsync(...)`. Raw WebSocket is appropriate for streaming pipelines where each connection is independent (voice, telemetry); SignalR is appropriate when broadcast/group/presence are core requirements.
+All push only to the *currently-executing* connection. Broadcast / target-by-ConnectionId / target-by-group is **not** built into raw WebSocket today — see [BACKLOG](docs/BACKLOG.md) "Connection registry / fan-out push." For those patterns, use SignalR (`Cirreum.Runtime.Invocation.SignalR`) — it has them natively via `IHubContext<THub>.Clients.X.SendAsync(...)`. Raw WebSocket is appropriate for streaming pipelines where each connection is independent (voice, telemetry); SignalR is appropriate when broadcast/group/presence are core requirements.
 
 ## Connection lifecycle
 
@@ -478,7 +540,7 @@ After accept, the negotiated value is exposed via `Connection.SubProtocol` (read
 ## Dependencies
 
 - **Cirreum.Runtime.InvocationProvider** `1.1.0+` — L4 helper (`IInvocationBuilder` scope object, `RegisterInvocationProvider<>` helper, `InvocationProviderMapping` record)
-- **Cirreum.Invocation.WebSockets** `1.0.0+` — L3 registrar, orchestrator, connection adapter, `IConnectionSender` impl, `IWebSocketUrlBuilder`, `WebSocketHandler` base
+- **Cirreum.Invocation.WebSockets** `1.2.0+` — L3 registrar, orchestrator, `IWebSocketConnection` interface + connection adapter (with typed `SendAsync<T>` and `SendBytesAsync`), `IWebSocketUrlBuilder`, `WebSocketHandler` base
 - **Microsoft.AspNetCore.App** (framework reference) — WebSocket (`Microsoft.AspNetCore.WebSockets`), endpoint routing, hosting
 
 ## Versioning

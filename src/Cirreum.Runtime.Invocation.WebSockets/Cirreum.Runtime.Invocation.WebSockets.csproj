@@ -11,8 +11,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="Cirreum.Runtime.InvocationProvider" Version="1.1.1" />
-		<PackageReference Include="Cirreum.Invocation.WebSockets" Version="1.1.0" />
+		<PackageReference Include="Cirreum.Runtime.InvocationProvider" Version="1.2.0" />
+		<PackageReference Include="Cirreum.Invocation.WebSockets" Version="1.2.1" />
 	</ItemGroup>
 
 </Project>
