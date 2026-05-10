@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-05-10
+
 ### Added
 
 - **Provider-level `WebSocketOptions` configuration** — `AddWebSocketInvocation()` now binds `Cirreum:Invocation:Providers:WebSocket:WebSocketOptions` to ASP.NET's `IOptions<WebSocketOptions>` (using `services.Configure<WebSocketOptions>(section)`). The WebSocket middleware reads from DI at request time, so `MapWebSocketInvocation()`'s call to `app.UseWebSockets()` automatically picks up these values — apps no longer need to call `app.UseWebSockets(options)` themselves before `MapWebSocketInvocation()`. Set provider-level `KeepAliveInterval`, `KeepAliveTimeout`, and `AllowedOrigins` directly in configuration:
