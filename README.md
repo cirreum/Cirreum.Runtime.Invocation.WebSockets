@@ -1,3 +1,16 @@
+> [!WARNING]
+> **This package is deprecated and this repository is archived.**
+>
+> The Invocation provider family is no longer maintained. The inbound invocation seam ships today in
+> `Cirreum.Services.Server` — hubs, WebSocket handlers, and the HTTP-to-invocation-context bridge —
+> and the caller side of a long-lived connection ships as `Cirreum.RemoteConnections.SignalR` and
+> `Cirreum.RemoteConnections.WebSockets`.
+>
+> Everything below this line is retained as a historical record and does not describe a supported
+> package.
+
+---
+
 # Cirreum Runtime Invocation WebSockets
 
 [![NuGet Version](https://img.shields.io/nuget/v/Cirreum.Runtime.Invocation.WebSockets.svg?style=flat-square&labelColor=1F1F1F&color=003D8F)](https://www.nuget.org/packages/Cirreum.Runtime.Invocation.WebSockets/)
